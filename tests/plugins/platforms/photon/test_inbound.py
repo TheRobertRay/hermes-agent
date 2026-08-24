@@ -235,7 +235,7 @@ async def test_heic_attachment_reaches_native_image_content(
 
     assert len(captured) == 1
     inbound = captured[0]
-    assert inbound.message_type == MessageType.IMAGE
+    assert inbound.message_type == MessageType.PHOTO
     assert inbound.media_types == ["image/heic"]
     assert len(inbound.media_urls) == 1
     cached = Path(inbound.media_urls[0])
