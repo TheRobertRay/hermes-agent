@@ -407,6 +407,30 @@ class TestFormatCompatibility:
             f"BMP must be transcoded to PNG for cross-provider compatibility, got: {url[:60]}"
         )
 
+    def test_heic_decoder_is_registered_and_transcodes_to_png(self, tmp_path: Path):
+        """The core install must turn an ordinary iPhone HEIC into model-safe PNG."""
+        from io import BytesIO
+
+        from PIL import Image
+        import pillow_heif
+
+        from agent.image_routing import _file_to_data_url
+
+        source = Image.new("RGB", (7, 11), (20, 80, 140))
+        encoded = BytesIO()
+        pillow_heif.from_pillow(source).save(encoded)
+        img_path = tmp_path / "iphone-screenshot.heic"
+        img_path.write_bytes(encoded.getvalue())
+
+        url = _file_to_data_url(img_path)
+
+        assert url is not None
+        assert url.startswith("data:image/png;base64,")
+        png = base64.b64decode(url.split(",", 1)[1])
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        with Image.open(BytesIO(png)) as decoded:
+            assert decoded.size == (7, 11)
+
 
     def test_png_passes_through_no_transcode(self, tmp_path: Path):
         """Universal-safe formats must NOT be re-encoded — preserves bytes."""
