@@ -203,6 +203,58 @@ async def test_caf_attachment_named_promoted_to_voice(
 
 
 @pytest.mark.asyncio
+async def test_heic_attachment_reaches_native_image_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Photon cache plus native routing preserves actual pixels for iPhone HEIC."""
+    from io import BytesIO
+
+    from PIL import Image
+    import pillow_heif
+
+    from agent.image_routing import build_native_content_parts
+
+    source = Image.new("RGB", (9, 13), (90, 40, 10))
+    encoded = BytesIO()
+    pillow_heif.from_pillow(source).save(encoded)
+    raw = encoded.getvalue()
+
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    event = _attachment_event(
+        {
+            "name": "iphone-screenshot.heic",
+            "mimeType": "image/heic",
+            "size": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        }
+    )
+
+    await adapter._dispatch_inbound(event)
+
+    assert len(captured) == 1
+    inbound = captured[0]
+    assert inbound.message_type == MessageType.PHOTO
+    assert inbound.media_types == ["image/heic"]
+    assert len(inbound.media_urls) == 1
+    cached = Path(inbound.media_urls[0])
+    try:
+        parts, skipped = build_native_content_parts(inbound.text, [str(cached)])
+        assert skipped == []
+        image_parts = [part for part in parts if part.get("type") == "image_url"]
+        assert len(image_parts) == 1
+        url = image_parts[0]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        png = base64.b64decode(url.split(",", 1)[1])
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        with Image.open(BytesIO(png)) as decoded:
+            assert decoded.size == (9, 13)
+    finally:
+        cached.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_fffc_placeholder_no_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
