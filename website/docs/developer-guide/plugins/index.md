@@ -605,7 +605,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 |------|-----------|-------------------|---------|
 | [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str` | optional directive: `{"action": "block", "message": ...}` vetoes the call; `{"action": "approve", "message": ...}` escalates to the human-approval gate |
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
-| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
+| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str, sender_id: str, destination_chat_id: str, destination_chat_type: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
 | [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
@@ -624,6 +624,15 @@ The kanban lifecycle hooks fire **after** the board DB change commits, so a call
 ### `pre_llm_call` context injection
 
 This is the only hook whose return value matters. When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.
+
+Gateway turns also provide source-bound `sender_id`, `destination_chat_id`, and
+`destination_chat_type` fields. Plugins may use all three together for
+destination-aware policy. Treat missing or unrecognized destination types as
+unknown; do not infer that a destination is private from an empty value.
+Hermes binds each gateway agent and model conversation to its original
+provider route. If that destination identity changes in place, the next turn
+fails before hooks, memory retrieval, persistence, or a provider request.
+Start a fresh destination-bound agent instead of reusing the conversation.
 
 #### Return format
 
