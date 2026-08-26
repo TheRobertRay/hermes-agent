@@ -54,9 +54,10 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,40 @@ _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+
+_DYNAMIC_VERBS: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {}
+_DYNAMIC_VERBS_LOCK = threading.RLock()
+
+
+def register_control_verb(
+    verb: str,
+    handler: Callable[[Mapping[str, Any]], dict[str, Any]],
+) -> Callable[[], None]:
+    """Register one narrow in-process gateway control verb.
+
+    Plugins use this only for profile-owned structured RPCs that must execute in
+    the already-running gateway process. The local socket remains the transport;
+    no second service or provider owner is created.
+    """
+
+    if (
+        not isinstance(verb, str)
+        or not verb.startswith("unified_life.")
+        or len(verb) > 96
+        or not callable(handler)
+    ):
+        raise ValueError("gateway control verb is invalid")
+    with _DYNAMIC_VERBS_LOCK:
+        if verb in _DYNAMIC_VERBS:
+            raise ValueError("gateway control verb is already registered")
+        _DYNAMIC_VERBS[verb] = handler
+
+    def unregister() -> None:
+        with _DYNAMIC_VERBS_LOCK:
+            if _DYNAMIC_VERBS.get(verb) is handler:
+                _DYNAMIC_VERBS.pop(verb, None)
+
+    return unregister
 
 
 # ---------------------------------------------------------------------------
@@ -353,18 +388,31 @@ class GatewayControlServer:
             request_id = request.get("id")
             verb = request.get("verb")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
-            if handler is None:
+            with _DYNAMIC_VERBS_LOCK:
+                dynamic_handler = (
+                    _DYNAMIC_VERBS.get(verb) if isinstance(verb, str) else None
+                )
+            if handler is None and dynamic_handler is None:
                 response: dict[str, Any] = {
                     "ok": False,
                     "error": f"unknown verb: {verb!r}",
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "supported_verbs": sorted(self._handlers),
+                    "supported_verbs": sorted(
+                        set(self._handlers) | set(_DYNAMIC_VERBS)
+                    ),
                 }
             else:
+                payload = request.get("payload", {})
+                if not isinstance(payload, dict):
+                    raise ValueError("request payload must be a JSON object")
                 response = {
                     "ok": True,
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "result": handler(),
+                    "result": (
+                        dynamic_handler(payload)
+                        if dynamic_handler is not None
+                        else handler()
+                    ),
                 }
         except Exception as exc:
             response = {
@@ -441,6 +489,7 @@ def query_gateway_control(
     home: Path,
     verb: str,
     *,
+    payload: Optional[Mapping[str, Any]] = None,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
@@ -450,11 +499,14 @@ def query_gateway_control(
     ``ok: false`` — returns None so callers fall back to the scan layer.
     Never raises.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
+    request_body: dict[str, Any] = {
+        "verb": verb,
+        "id": 1,
+        "protocol": CONTROL_PROTOCOL_VERSION,
+    }
+    if payload is not None:
+        request_body["payload"] = dict(payload)
+    request = json.dumps(request_body).encode("utf-8") + b"\n"
     try:
         if _IS_WINDOWS:
             raw = _query_windows_pipe(Path(home), request, timeout)
