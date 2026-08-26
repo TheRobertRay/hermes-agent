@@ -13,6 +13,7 @@ from gateway.control_socket import (
     GatewayControlServer,
     identify_gateway,
     query_gateway_control,
+    register_control_verb,
     resolve_client_socket_path,
     resolve_server_socket_path,
     windows_pipe_name,
@@ -126,6 +127,36 @@ def test_server_answers_identify_and_status(home: Path):
     ident, status = _run(scenario())
     assert ident == {"pid": 4242, "code_sha": "abc123", "protocol": 1}
     assert status == {"gateway_state": "running"}
+
+
+def test_registered_structured_verb_reaches_live_server_once(home: Path):
+    calls = []
+    unregister = register_control_verb(
+        "unified_life.approve_week_table",
+        lambda payload: calls.append(payload) or {"status": "verified"},
+    )
+
+    async def scenario():
+        server = GatewayControlServer(home)
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: query_gateway_control(
+                    home,
+                    "unified_life.approve_week_table",
+                    payload={"approval_id": "week-table-1"},
+                ),
+            )
+        finally:
+            await server.stop()
+
+    try:
+        assert _run(scenario()) == {"status": "verified"}
+        assert calls == [{"approval_id": "week-table-1"}]
+    finally:
+        unregister()
 
 
 def test_unknown_verb_and_malformed_request(home: Path):
