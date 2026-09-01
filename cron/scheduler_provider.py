@@ -532,6 +532,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        desktop_owner_guard=False,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -559,19 +560,27 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                desktop_owner_guard=desktop_owner_guard,
             )
             return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
-        if recovered:
-            logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
-                recovered,
-            )
-        # Heartbeat once before the first sleep so `hermes cron status` sees a
-        # live ticker immediately after startup, not only after the first tick.
-        record_ticker_heartbeat()
+        def _may_dispatch() -> bool:
+            if not desktop_owner_guard:
+                return True
+            from cron.scheduler import desktop_scheduler_may_dispatch
+
+            return desktop_scheduler_may_dispatch()
+
+        if _may_dispatch():
+            recovered = self.recover_interrupted()
+            if recovered:
+                logger.warning(
+                    "Marked %d interrupted cron execution(s) unknown after restart",
+                    recovered,
+                )
+            # A deferred Desktop ticker must not impersonate gateway liveness.
+            record_ticker_heartbeat()
         # Exponential backoff for consecutive tick failures — most importantly
         # fd exhaustion (EMFILE/ENFILE, #87644).  While FDs stay exhausted the
         # ticker must NOT hammer the store every 60s; once they free (leak
@@ -579,6 +588,9 @@ class InProcessCronScheduler(CronScheduler):
         # resets, so the scheduler self-heals without a gateway restart.
         consecutive_failures = 0
         while not stop_event.is_set():
+            if not _may_dispatch():
+                stop_event.wait(interval)
+                continue
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
@@ -590,6 +602,7 @@ class InProcessCronScheduler(CronScheduler):
                         loop=loop,
                         sync=False,
                         can_dispatch=can_dispatch,
+                        desktop_owner_guard=desktop_owner_guard,
                     )
                 ok = True
             except BaseException as e:
@@ -630,6 +643,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        desktop_owner_guard=False,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -656,12 +670,21 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
-        # Recovery + initial heartbeat for every profile.
+        def _may_dispatch() -> bool:
+            if not desktop_owner_guard:
+                return True
+            from cron.scheduler import desktop_scheduler_may_dispatch
+
+            return desktop_scheduler_may_dispatch()
+
+        # Recovery + initial heartbeat only where Desktop may own the profile.
         for entry in profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
+                    if not _may_dispatch():
+                        continue
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
@@ -677,6 +700,7 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             _tick_error = None
+            attempted_homes = []
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
@@ -686,12 +710,16 @@ class InProcessCronScheduler(CronScheduler):
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                if not _may_dispatch():
+                                    continue
+                                attempted_homes.append(home)
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
+                                    desktop_owner_guard=desktop_owner_guard,
                                 )
                         finally:
                             reset_hermes_home_override(home_token)
@@ -706,6 +734,8 @@ class InProcessCronScheduler(CronScheduler):
             # Record per-profile heartbeat after each tick cycle.
             for entry in profile_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry
+                if home not in attempted_homes:
+                    continue
                 home_token = set_hermes_home_override(str(home))
                 try:
                     with use_cron_store(home):
